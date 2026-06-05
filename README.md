@@ -126,8 +126,4 @@ This overwrites `sample_input.xlsx` with a fresh 25-row dataset covering 13 empl
 - *Raw*: total FTE across all projects for an employee exceeds 1.05 (ignores probability)
 - *Expected*: probability-weighted total FTE exceeds 1.05
 
----
 
-## Versioning
-
-Current version: **1.0.0**

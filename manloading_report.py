@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-VERSION = "1.0.0"
-
 import argparse
 from datetime import datetime
 from pathlib import Path
