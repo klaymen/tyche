@@ -1039,6 +1039,11 @@ filter_bar_html = (
 )
 
 # ── Assemble HTML ─────────────────────────────────────────────────────────────
+import subprocess as _sp
+_git_hash = _sp.run(
+    ["git", "rev-parse", "--short", "HEAD"],
+    capture_output=True, text=True, cwd=Path(__file__).parent
+).stdout.strip() or "unknown"
 generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 _charge_proj_html, _charge_grp_html, _charge_emp_html = charge_tables_html()
 
@@ -1593,7 +1598,7 @@ HTML = f"""<!doctype html>
       <h1>Tyche · Manloading Report</h1>
     </div>
     <div class="hero-meta">
-      <span class="stamp-value">v{VERSION} &middot; Generated on {generated_at}</span>
+      <span class="stamp-value">{_git_hash} &middot; Generated on {generated_at}</span>
     </div>
   </header>
 
