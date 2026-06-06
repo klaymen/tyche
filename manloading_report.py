@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 
 import argparse
 from datetime import datetime
@@ -1518,6 +1518,11 @@ HTML = f"""<!doctype html>
       opacity:.55;
     }}
     .charge-factor:hover {{ filter:brightness(1.08); }}
+
+    /* ── Charge meaning label ── */
+    .charge-meaning {{
+      color:var(--accent); font-weight:600; font-size:.82rem;
+    }}
     #sec-charge .proj-table-total td,
     #sec-charge .cum-row td {{
       /* inherit the refined style already declared below */
@@ -1812,6 +1817,8 @@ HTML = f"""<!doctype html>
           <button class="charge-factor" id="cfac-rate" data-factor="rate" aria-pressed="true">Hourly Rate</button>
           <span class="charge-op">&times;</span>
           <button class="charge-factor" id="cfac-hours" data-factor="hours" aria-pressed="true">Monthly Hours</button>
+          <span class="charge-op">=</span>
+          <span class="charge-meaning" id="charge-meaning">Expected cost</span>
         </p>
       </div>
       <div class="charge-controls">
@@ -2255,6 +2262,24 @@ HTML = f"""<!doctype html>
       if (window._recalcFilterable) window._recalcFilterable();
     }}
 
+    const MEANINGS = [
+      [true,  true,  true,  'Expected cost'],
+      [true,  true,  false, 'Cost per hour of capacity (rate base)'],
+      [true,  false, true,  'Expected FTE\u00b7hours (prob-weighted)'],
+      [true,  false, false, 'Expected FTE\u00b7months (prob-weighted)'],
+      [false, true,  true,  'Budget ceiling \u2014 ignores probability'],
+      [false, true,  false, 'Rate\u00b7FTE base (per hour, ceiling)'],
+      [false, false, true,  'Raw FTE\u00b7hours (unweighted)'],
+      [false, false, false, 'Raw FTE\u00b7months (unweighted)'],
+    ];
+
+    function updateMeaning() {{
+      const el = document.getElementById('charge-meaning');
+      if (!el) return;
+      const m = MEANINGS.find(r => r[0]===factors.prob && r[1]===factors.rate && r[2]===factors.hours);
+      el.textContent = m ? m[3] : '';
+    }}
+
     // Wire factor buttons
     document.querySelectorAll('.charge-factor').forEach(btn => {{
       btn.addEventListener('click', () => {{
@@ -2266,6 +2291,7 @@ HTML = f"""<!doctype html>
           const ctrl = document.querySelector('.charge-controls');
           if (ctrl) ctrl.style.opacity = factors.hours ? '1' : '0.35';
         }}
+        updateMeaning();
         recalcCharge();
       }});
     }});
