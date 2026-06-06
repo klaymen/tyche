@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 
 import argparse
 from datetime import datetime
@@ -63,21 +63,41 @@ emp_pw_month.columns = MONTH_COLS
 # Per-project average probability
 proj_avg_prob: dict[str, float] = raw.groupby("Project")["Probability"].mean().to_dict()
 
-# ── Charge base: FTE × Probability × Hourly Rate  (multiply by monthly hours at display time)
+# ── Charge bases (multiply by monthly hours at display time)
+# data-base      = FTE × Probability × Hourly Rate  (all factors on)
+# data-base-fte  = FTE only
+# data-base-prob = FTE × Probability
+# data-base-rate = FTE × Hourly Rate (no probability)
 _hr = raw["Hourly Rate"].fillna(0) if "Hourly Rate" in raw.columns else 0
 for _m in MONTH_COLS:
-    raw[f"_cb_{_m}"] = raw[_m] * raw["Probability"] * _hr
-_CB_COLS = [f"_cb_{m}" for m in MONTH_COLS]
+    raw[f"_cb_{_m}"]      = raw[_m] * raw["Probability"] * _hr   # full base
+    raw[f"_cbf_{_m}"]     = raw[_m]                               # FTE only
+    raw[f"_cbp_{_m}"]     = raw[_m] * raw["Probability"]          # FTE × Prob
+    raw[f"_cbr_{_m}"]     = raw[_m] * _hr                         # FTE × Rate
+_CB_COLS  = [f"_cb_{m}"  for m in MONTH_COLS]
+_CBF_COLS = [f"_cbf_{m}" for m in MONTH_COLS]
+_CBP_COLS = [f"_cbp_{m}" for m in MONTH_COLS]
+_CBR_COLS = [f"_cbr_{m}" for m in MONTH_COLS]
 
-proj_charge_base = raw.groupby("Project")[_CB_COLS].sum()
-proj_charge_base.columns = MONTH_COLS
+def _make_charge_tables(groupby_col, cb, cbf, cbp, cbr):
+    """Return (base, base_fte, base_prob, base_rate) DataFrames grouped by col."""
+    def _agg(cols):
+        t = raw.groupby(groupby_col)[cols].sum()
+        t.columns = MONTH_COLS
+        return t
+    return _agg(cb), _agg(cbf), _agg(cbp), _agg(cbr)
 
-grp_charge_base = raw.groupby("Project Group")[_CB_COLS].sum() if "Project Group" in raw.columns else None
-if grp_charge_base is not None:
-    grp_charge_base.columns = MONTH_COLS
+proj_charge_base, proj_charge_fte, proj_charge_prob, proj_charge_rate = \
+    _make_charge_tables("Project", _CB_COLS, _CBF_COLS, _CBP_COLS, _CBR_COLS)
 
-emp_charge_base = raw.groupby("Employee")[_CB_COLS].sum()
-emp_charge_base.columns = MONTH_COLS
+if "Project Group" in raw.columns:
+    grp_charge_base, grp_charge_fte, grp_charge_prob, grp_charge_rate = \
+        _make_charge_tables("Project Group", _CB_COLS, _CBF_COLS, _CBP_COLS, _CBR_COLS)
+else:
+    grp_charge_base = grp_charge_fte = grp_charge_prob = grp_charge_rate = None
+
+emp_charge_base, emp_charge_fte, emp_charge_prob, emp_charge_rate = \
+    _make_charge_tables("Employee", _CB_COLS, _CBF_COLS, _CBP_COLS, _CBR_COLS)
 
 def _slug(s: str) -> str:
     """URL-safe id slug for a project name."""
@@ -154,7 +174,7 @@ def stat_cards() -> str:
         <div class="stat-card">
           <div class="stat-card-header">
             <h3>{label}</h3>
-            <span class="tip" tabindex="0" title="{tip}" aria-label="{label} help">?</span>
+            <span class="tip" tabindex="0" data-tip="{tip}" aria-label="{label} help">?</span>
           </div>
           <div class="stat-value" style="color:{color}">{val}</div>
         </div>"""
@@ -568,6 +588,30 @@ def charge_tables_html() -> str:
     """Project × Month and Group × Month charge tables (base values; JS multiplies by monthly hours)."""
     th_months = "".join(f'<th class="th-month">{m}</th>' for m in MONTH_COLS)
 
+    def _cell_attrs(base_df, fte_df, prob_df, rate_df, key, m):
+        b  = float(base_df.loc[key, m])
+        bf = float(fte_df.loc[key, m])
+        bp = float(prob_df.loc[key, m])
+        br = float(rate_df.loc[key, m])
+        return f'data-base="{b:.4f}" data-base-fte="{bf:.4f}" data-base-prob="{bp:.4f}" data-base-rate="{br:.4f}"'
+
+    def _total_attrs(base_df, fte_df, prob_df, rate_df, key):
+        b  = float(base_df.loc[key, MONTH_COLS].sum())
+        bf = float(fte_df.loc[key, MONTH_COLS].sum())
+        bp = float(prob_df.loc[key, MONTH_COLS].sum())
+        br = float(rate_df.loc[key, MONTH_COLS].sum())
+        return f'data-base="{b:.4f}" data-base-fte="{bf:.4f}" data-base-prob="{bp:.4f}" data-base-rate="{br:.4f}"', b
+
+    def _month_totals_attrs(base_df, fte_df, prob_df, rate_df):
+        rows = []
+        for i, m in enumerate(MONTH_COLS):
+            b  = float(base_df[m].sum())
+            bf = float(fte_df[m].sum())
+            bp = float(prob_df[m].sum())
+            br = float(rate_df[m].sum())
+            rows.append((b, bf, bp, br))
+        return rows
+
     # ── Project table ─────────────────────────────────────────────
     proj_html = f"""<table id="charge-proj-table" class="charge-table filterable-table">
     <thead><tr>
@@ -578,42 +622,47 @@ def charge_tables_html() -> str:
         if proj not in proj_charge_base.index:
             continue
         color = PROJECT_COLORS[i % len(PROJECT_COLORS)]["border"]
-        base_vals = [float(proj_charge_base.loc[proj, m]) for m in MONTH_COLS]
-        row_base  = sum(base_vals)
         cells = "".join(
-            f'<td class="td-num charge-cell" data-base="{v:.4f}">'
-            f'{v * _DEFAULT_MONTHLY_HOURS:,.0f}</td>'
-            for v in base_vals
+            f'<td class="td-num charge-cell" {_cell_attrs(proj_charge_base, proj_charge_fte, proj_charge_prob, proj_charge_rate, proj, m)}>'
+            f'{float(proj_charge_base.loc[proj, m]) * _DEFAULT_MONTHLY_HOURS:,.0f}</td>'
+            for m in MONTH_COLS
         )
+        t_attrs, row_base = _total_attrs(proj_charge_base, proj_charge_fte, proj_charge_prob, proj_charge_rate, proj)
         proj_html += (
             f'<tr>'
             f'<td class="td-proj"><span class="proj-dot" style="background:{color}"></span>{proj}</td>'
             f'{cells}'
-            f'<td class="td-total charge-total-cell" data-base="{row_base:.4f}" style="color:{color}">'
+            f'<td class="td-total charge-total-cell" {t_attrs} style="color:{color}">'
             f'{row_base * _DEFAULT_MONTHLY_HOURS:,.0f}</td>'
             f'</tr>'
         )
 
-    proj_month_base = [float(proj_charge_base[m].sum()) for m in MONTH_COLS]
-    grand_base = sum(proj_month_base)
+    mt = _month_totals_attrs(proj_charge_base, proj_charge_fte, proj_charge_prob, proj_charge_rate)
+    grand_base = sum(r[0] for r in mt)
+    grand_fte  = sum(r[1] for r in mt)
+    grand_prob = sum(r[2] for r in mt)
+    grand_rate = sum(r[3] for r in mt)
     total_cells = "".join(
-        f'<td data-base="{v:.4f}">{v * _DEFAULT_MONTHLY_HOURS:,.0f}</td>'
-        for v in proj_month_base
+        f'<td data-base="{r[0]:.4f}" data-base-fte="{r[1]:.4f}" data-base-prob="{r[2]:.4f}" data-base-rate="{r[3]:.4f}">'
+        f'{r[0] * _DEFAULT_MONTHLY_HOURS:,.0f}</td>'
+        for r in mt
     )
     cum_cells = "".join(
-        f'<td class="fte-cell-cum charge-cell" data-base="{sum(proj_month_base[i:]):.4f}">'
-        f'{sum(proj_month_base[i:]) * _DEFAULT_MONTHLY_HOURS:,.0f}</td>'
-        for i in range(len(proj_month_base))
+        f'<td class="fte-cell-cum charge-cell"'
+        f' data-base="{sum(r[0] for r in mt[i:]):.4f}"'
+        f' data-base-fte="{sum(r[1] for r in mt[i:]):.4f}"'
+        f' data-base-prob="{sum(r[2] for r in mt[i:]):.4f}"'
+        f' data-base-rate="{sum(r[3] for r in mt[i:]):.4f}">'
+        f'{sum(r[0] for r in mt[i:]) * _DEFAULT_MONTHLY_HOURS:,.0f}</td>'
+        for i in range(len(mt))
     )
     proj_html += (
-        f'<tr class="proj-table-total">'
-        f'<td>Total</td>{total_cells}'
-        f'<td data-base="{grand_base:.4f}">{grand_base * _DEFAULT_MONTHLY_HOURS:,.0f}</td>'
-        f'</tr>'
-        f'<tr class="cum-row">'
-        f'<td class="cum-label">REMAINING</td>{cum_cells}'
-        f'<td class="fte-cell-cum" data-base="{grand_base:.4f}">{grand_base * _DEFAULT_MONTHLY_HOURS:,.0f}</td>'
-        f'</tr>'
+        f'<tr class="proj-table-total"><td>Total</td>{total_cells}'
+        f'<td data-base="{grand_base:.4f}" data-base-fte="{grand_fte:.4f}" data-base-prob="{grand_prob:.4f}" data-base-rate="{grand_rate:.4f}">'
+        f'{grand_base * _DEFAULT_MONTHLY_HOURS:,.0f}</td></tr>'
+        f'<tr class="cum-row"><td class="cum-label">REMAINING</td>{cum_cells}'
+        f'<td class="fte-cell-cum" data-base="{grand_base:.4f}" data-base-fte="{grand_fte:.4f}" data-base-prob="{grand_prob:.4f}" data-base-rate="{grand_rate:.4f}">'
+        f'{grand_base * _DEFAULT_MONTHLY_HOURS:,.0f}</td></tr>'
     )
     proj_html += "</tbody></table>"
 
@@ -629,42 +678,47 @@ def charge_tables_html() -> str:
             if group not in grp_charge_base.index:
                 continue
             color = _GROUP_COLORS[gi % len(_GROUP_COLORS)]
-            base_vals = [float(grp_charge_base.loc[group, m]) for m in MONTH_COLS]
-            row_base  = sum(base_vals)
             cells = "".join(
-                f'<td class="td-num charge-cell" data-base="{v:.4f}">'
-                f'{v * _DEFAULT_MONTHLY_HOURS:,.0f}</td>'
-                for v in base_vals
+                f'<td class="td-num charge-cell" {_cell_attrs(grp_charge_base, grp_charge_fte, grp_charge_prob, grp_charge_rate, group, m)}>'
+                f'{float(grp_charge_base.loc[group, m]) * _DEFAULT_MONTHLY_HOURS:,.0f}</td>'
+                for m in MONTH_COLS
             )
+            t_attrs, row_base = _total_attrs(grp_charge_base, grp_charge_fte, grp_charge_prob, grp_charge_rate, group)
             grp_html += (
                 f'<tr>'
                 f'<td class="td-proj"><span class="proj-dot" style="background:{color}"></span>{group}</td>'
                 f'{cells}'
-                f'<td class="td-total charge-total-cell" data-base="{row_base:.4f}" style="color:{color}">'
+                f'<td class="td-total charge-total-cell" {t_attrs} style="color:{color}">'
                 f'{row_base * _DEFAULT_MONTHLY_HOURS:,.0f}</td>'
                 f'</tr>'
             )
 
-        grp_month_base = [float(grp_charge_base[m].sum()) for m in MONTH_COLS]
-        grp_grand_base = sum(grp_month_base)
+        gmt = _month_totals_attrs(grp_charge_base, grp_charge_fte, grp_charge_prob, grp_charge_rate)
+        gg_base = sum(r[0] for r in gmt)
+        gg_fte  = sum(r[1] for r in gmt)
+        gg_prob = sum(r[2] for r in gmt)
+        gg_rate = sum(r[3] for r in gmt)
         grp_total_cells = "".join(
-            f'<td data-base="{v:.4f}">{v * _DEFAULT_MONTHLY_HOURS:,.0f}</td>'
-            for v in grp_month_base
+            f'<td data-base="{r[0]:.4f}" data-base-fte="{r[1]:.4f}" data-base-prob="{r[2]:.4f}" data-base-rate="{r[3]:.4f}">'
+            f'{r[0] * _DEFAULT_MONTHLY_HOURS:,.0f}</td>'
+            for r in gmt
         )
         grp_cum_cells = "".join(
-            f'<td class="fte-cell-cum charge-cell" data-base="{sum(grp_month_base[i:]):.4f}">'
-            f'{sum(grp_month_base[i:]) * _DEFAULT_MONTHLY_HOURS:,.0f}</td>'
-            for i in range(len(grp_month_base))
+            f'<td class="fte-cell-cum charge-cell"'
+            f' data-base="{sum(r[0] for r in gmt[i:]):.4f}"'
+            f' data-base-fte="{sum(r[1] for r in gmt[i:]):.4f}"'
+            f' data-base-prob="{sum(r[2] for r in gmt[i:]):.4f}"'
+            f' data-base-rate="{sum(r[3] for r in gmt[i:]):.4f}">'
+            f'{sum(r[0] for r in gmt[i:]) * _DEFAULT_MONTHLY_HOURS:,.0f}</td>'
+            for i in range(len(gmt))
         )
         grp_html += (
-            f'<tr class="proj-table-total">'
-            f'<td>Total</td>{grp_total_cells}'
-            f'<td data-base="{grp_grand_base:.4f}">{grp_grand_base * _DEFAULT_MONTHLY_HOURS:,.0f}</td>'
-            f'</tr>'
-            f'<tr class="cum-row">'
-            f'<td class="cum-label">REMAINING</td>{grp_cum_cells}'
-            f'<td class="fte-cell-cum" data-base="{grp_grand_base:.4f}">{grp_grand_base * _DEFAULT_MONTHLY_HOURS:,.0f}</td>'
-            f'</tr>'
+            f'<tr class="proj-table-total"><td>Total</td>{grp_total_cells}'
+            f'<td data-base="{gg_base:.4f}" data-base-fte="{gg_fte:.4f}" data-base-prob="{gg_prob:.4f}" data-base-rate="{gg_rate:.4f}">'
+            f'{gg_base * _DEFAULT_MONTHLY_HOURS:,.0f}</td></tr>'
+            f'<tr class="cum-row"><td class="cum-label">REMAINING</td>{grp_cum_cells}'
+            f'<td class="fte-cell-cum" data-base="{gg_base:.4f}" data-base-fte="{gg_fte:.4f}" data-base-prob="{gg_prob:.4f}" data-base-rate="{gg_rate:.4f}">'
+            f'{gg_base * _DEFAULT_MONTHLY_HOURS:,.0f}</td></tr>'
         )
         grp_html += "</tbody></table>"
 
@@ -678,42 +732,47 @@ def charge_tables_html() -> str:
     for emp in EMPLOYEES:
         if emp not in emp_charge_base.index:
             continue
-        base_vals = [float(emp_charge_base.loc[emp, m]) for m in MONTH_COLS]
-        row_base  = sum(base_vals)
         cells = "".join(
-            f'<td class="td-num charge-cell" data-base="{v:.4f}">'
-            f'{v * _DEFAULT_MONTHLY_HOURS:,.0f}</td>'
-            for v in base_vals
+            f'<td class="td-num charge-cell" {_cell_attrs(emp_charge_base, emp_charge_fte, emp_charge_prob, emp_charge_rate, emp, m)}>'
+            f'{float(emp_charge_base.loc[emp, m]) * _DEFAULT_MONTHLY_HOURS:,.0f}</td>'
+            for m in MONTH_COLS
         )
+        t_attrs, row_base = _total_attrs(emp_charge_base, emp_charge_fte, emp_charge_prob, emp_charge_rate, emp)
         emp_html += (
             f'<tr>'
             f'<td class="td-emp">{emp}</td>'
             f'{cells}'
-            f'<td class="td-total charge-total-cell" data-base="{row_base:.4f}">'
+            f'<td class="td-total charge-total-cell" {t_attrs}>'
             f'{row_base * _DEFAULT_MONTHLY_HOURS:,.0f}</td>'
             f'</tr>'
         )
 
-    emp_month_base = [float(emp_charge_base[m].sum()) for m in MONTH_COLS]
-    emp_grand_base = sum(emp_month_base)
+    emt = _month_totals_attrs(emp_charge_base, emp_charge_fte, emp_charge_prob, emp_charge_rate)
+    eg_base = sum(r[0] for r in emt)
+    eg_fte  = sum(r[1] for r in emt)
+    eg_prob = sum(r[2] for r in emt)
+    eg_rate = sum(r[3] for r in emt)
     emp_total_cells = "".join(
-        f'<td data-base="{v:.4f}">{v * _DEFAULT_MONTHLY_HOURS:,.0f}</td>'
-        for v in emp_month_base
+        f'<td data-base="{r[0]:.4f}" data-base-fte="{r[1]:.4f}" data-base-prob="{r[2]:.4f}" data-base-rate="{r[3]:.4f}">'
+        f'{r[0] * _DEFAULT_MONTHLY_HOURS:,.0f}</td>'
+        for r in emt
     )
     emp_cum_cells = "".join(
-        f'<td class="fte-cell-cum charge-cell" data-base="{sum(emp_month_base[i:]):.4f}">'
-        f'{sum(emp_month_base[i:]) * _DEFAULT_MONTHLY_HOURS:,.0f}</td>'
-        for i in range(len(emp_month_base))
+        f'<td class="fte-cell-cum charge-cell"'
+        f' data-base="{sum(r[0] for r in emt[i:]):.4f}"'
+        f' data-base-fte="{sum(r[1] for r in emt[i:]):.4f}"'
+        f' data-base-prob="{sum(r[2] for r in emt[i:]):.4f}"'
+        f' data-base-rate="{sum(r[3] for r in emt[i:]):.4f}">'
+        f'{sum(r[0] for r in emt[i:]) * _DEFAULT_MONTHLY_HOURS:,.0f}</td>'
+        for i in range(len(emt))
     )
     emp_html += (
-        f'<tr class="proj-table-total">'
-        f'<td>Total</td>{emp_total_cells}'
-        f'<td data-base="{emp_grand_base:.4f}">{emp_grand_base * _DEFAULT_MONTHLY_HOURS:,.0f}</td>'
-        f'</tr>'
-        f'<tr class="cum-row">'
-        f'<td class="cum-label">REMAINING</td>{emp_cum_cells}'
-        f'<td class="fte-cell-cum" data-base="{emp_grand_base:.4f}">{emp_grand_base * _DEFAULT_MONTHLY_HOURS:,.0f}</td>'
-        f'</tr>'
+        f'<tr class="proj-table-total"><td>Total</td>{emp_total_cells}'
+        f'<td data-base="{eg_base:.4f}" data-base-fte="{eg_fte:.4f}" data-base-prob="{eg_prob:.4f}" data-base-rate="{eg_rate:.4f}">'
+        f'{eg_base * _DEFAULT_MONTHLY_HOURS:,.0f}</td></tr>'
+        f'<tr class="cum-row"><td class="cum-label">REMAINING</td>{emp_cum_cells}'
+        f'<td class="fte-cell-cum" data-base="{eg_base:.4f}" data-base-fte="{eg_fte:.4f}" data-base-prob="{eg_prob:.4f}" data-base-rate="{eg_rate:.4f}">'
+        f'{eg_base * _DEFAULT_MONTHLY_HOURS:,.0f}</td></tr>'
     )
     emp_html += "</tbody></table>"
 
@@ -1212,7 +1271,7 @@ HTML = f"""<!doctype html>
       text-transform:none; letter-spacing:0; flex-shrink:0;
     }}
     .tip:hover::after, .tip:focus-visible::after {{
-      content:attr(title);
+      content:attr(data-tip);
       position:absolute; left:50%; transform:translateX(-50%);
       bottom:calc(100% + 9px); min-width:180px; max-width:260px;
       background:#0f172a; color:#f8fafc; border-radius:8px;
@@ -1438,6 +1497,27 @@ HTML = f"""<!doctype html>
       font-size:.72rem; text-transform:uppercase; letter-spacing:.08em;
       color:var(--muted); padding:14px 18px 2px; font-weight:600;
     }}
+
+    /* ── Charge factor toggle chips ── */
+    .charge-equation {{
+      display:flex; align-items:center; flex-wrap:wrap; gap:5px;
+      margin:4px 0 0; font-size:.82rem; color:var(--muted);
+    }}
+    .charge-op {{ opacity:.5; }}
+    .charge-factor {{
+      display:inline-flex; align-items:center; gap:5px;
+      padding:3px 10px; border-radius:999px;
+      border:1.5px solid var(--accent); background:var(--accent);
+      color:#fff; font:inherit; font-size:.78rem; font-weight:600;
+      cursor:pointer; transition:background .15s,color .15s,border-color .15s,opacity .15s;
+      user-select:none;
+    }}
+    .charge-factor[aria-pressed="false"] {{
+      background:transparent; color:var(--muted);
+      border-color:var(--border); text-decoration:line-through;
+      opacity:.55;
+    }}
+    .charge-factor:hover {{ filter:brightness(1.08); }}
     #sec-charge .proj-table-total td,
     #sec-charge .cum-row td {{
       /* inherit the refined style already declared below */
@@ -1618,7 +1698,7 @@ HTML = f"""<!doctype html>
       <div>
         <p class="section-title" style="display:flex;align-items:center;gap:6px;">Employee Utilisation Heatmap
           <span class="tip" tabindex="0"
-            title="Each cell shows expected FTE load (raw FTE x project probability). Colours: grey = 0, blue = under 50%, yellow = 50-85%, green = 85-105%, red = over 105%. The small clock icon marks cells where the raw unweighted FTE exceeds 1.05 — a potential overallocation before probability discounting." aria-label="Heatmap help">?</span>
+            data-tip="Each cell shows expected FTE load (raw FTE x project probability). Colours: grey = 0, yellow = under 50%, blue = 50–<100%, green = 100%, red = over 100%. The small clock icon marks cells where the raw unweighted FTE exceeds 1.05 — a potential overallocation before probability discounting." aria-label="Heatmap help">?</span>
         </p>
         <p class="section-sub">Probability-weighted FTE per employee per month (raw FTE × project probability)</p>
       </div>
@@ -1724,7 +1804,15 @@ HTML = f"""<!doctype html>
     <div class="card-header">
       <div>
         <p class="section-title">Charge</p>
-        <p class="section-sub">Expected cost = FTE &times; Probability &times; Hourly Rate &times; Monthly Hours</p>
+        <p class="section-sub charge-equation">
+          FTE
+          <span class="charge-op">&times;</span>
+          <button class="charge-factor" id="cfac-prob" data-factor="prob" aria-pressed="true">Probability</button>
+          <span class="charge-op">&times;</span>
+          <button class="charge-factor" id="cfac-rate" data-factor="rate" aria-pressed="true">Hourly Rate</button>
+          <span class="charge-op">&times;</span>
+          <button class="charge-factor" id="cfac-hours" data-factor="hours" aria-pressed="true">Monthly Hours</button>
+        </p>
       </div>
       <div class="charge-controls">
         <label class="charge-hours-label" for="chargeHours">Monthly hours</label>
@@ -1751,8 +1839,39 @@ HTML = f"""<!doctype html>
       tip.style.left = (x + tip.offsetWidth  > window.innerWidth  ? e.clientX - tip.offsetWidth  - 6 : x) + 'px';
       tip.style.top  = (y + tip.offsetHeight > window.innerHeight ? e.clientY - tip.offsetHeight - 6 : y) + 'px';
     }}
+    const FTE_COLORS = {{
+      light: {{
+        'fte-zero': {{bg:'#f1f3f5', color:'#aab2be'}},
+        'fte-low':  {{bg:'#fef9c3', color:'#854d0e'}},
+        'fte-mid':  {{bg:'#bfdbfe', color:'#1e3a8a'}},
+        'fte-full': {{bg:'#bbf7d0', color:'#14532d'}},
+        'fte-over': {{bg:'#fca5a5', color:'#7f1d1d'}},
+      }},
+      dark: {{
+        'fte-zero': {{bg:'#253347', color:'#6a7f96'}},
+        'fte-low':  {{bg:'#3a2c07', color:'#fcd34d'}},
+        'fte-mid':  {{bg:'#132454', color:'#7dd3fc'}},
+        'fte-full': {{bg:'#0b3321', color:'#4ade80'}},
+        'fte-over': {{bg:'#3d0c0c', color:'#f87171'}},
+      }},
+    }};
     document.querySelectorAll('[data-cell-tip]').forEach(el => {{
-      el.addEventListener('mouseenter', e => {{ if (!el.dataset.cellTip) return; tip.textContent = el.dataset.cellTip; tip.style.opacity = '1'; move(e); }});
+      el.addEventListener('mouseenter', e => {{
+        if (!el.dataset.cellTip) return;
+        tip.textContent = el.dataset.cellTip;
+        const palette = FTE_COLORS[document.body.classList.contains('dark') ? 'dark' : 'light'];
+        const matched = Object.keys(palette).find(cls => el.classList.contains(cls));
+        if (matched) {{
+          tip.style.background = palette[matched].bg;
+          tip.style.color = palette[matched].color;
+          tip.style.boxShadow = '0 4px 14px rgba(0,0,0,.20)';
+        }} else {{
+          tip.style.background = '#1a2438';
+          tip.style.color = '#e2e8f2';
+          tip.style.boxShadow = '0 4px 14px rgba(0,0,0,.35)';
+        }}
+        tip.style.opacity = '1'; move(e);
+      }});
       el.addEventListener('mousemove',  move);
       el.addEventListener('mouseleave', ()  => {{ tip.style.opacity = '0'; }});
     }});
@@ -2034,7 +2153,26 @@ HTML = f"""<!doctype html>
 
       const isProjTotal = totalRow.classList.contains('proj-table-total');
       const nMonths = isProjTotal ? totalRow.cells.length - 2 : totalRow.cells.length - 1;
-      const hours   = isCharge ? (parseFloat(document.getElementById('chargeHours')?.value) || 0) : 1;
+
+      // For charge tables, pick the right base key and hours multiplier from active factors
+      let hours = 1;
+      let chargeBase = cell => parseFloat(cell.dataset.base) || 0;
+      let fmtVal = v => v.toFixed(2);
+      if (isCharge) {{
+        const cFactors = {{
+          prob:  document.getElementById('cfac-prob')?.getAttribute('aria-pressed')  !== 'false',
+          rate:  document.getElementById('cfac-rate')?.getAttribute('aria-pressed')  !== 'false',
+          hours: document.getElementById('cfac-hours')?.getAttribute('aria-pressed') !== 'false',
+        }};
+        hours = cFactors.hours ? (parseFloat(document.getElementById('chargeHours')?.value) || 0) : 1;
+        if (cFactors.prob && cFactors.rate)       chargeBase = c => parseFloat(c.dataset.base)     || 0;
+        else if (cFactors.prob && !cFactors.rate) chargeBase = c => parseFloat(c.dataset.baseProb) || 0;
+        else if (!cFactors.prob && cFactors.rate) chargeBase = c => parseFloat(c.dataset.baseRate) || 0;
+        else                                      chargeBase = c => parseFloat(c.dataset.baseFte)  || 0;
+        fmtVal = (cFactors.rate || cFactors.prob)
+          ? v => Math.round(v).toLocaleString()
+          : v => v.toFixed(2);
+      }}
 
       const dataRows = Array.from(tbody.rows).filter(tr =>
         !tr.classList.contains('proj-table-total') &&
@@ -2049,15 +2187,13 @@ HTML = f"""<!doctype html>
           const cell = tr.cells[i + 1];
           if (!cell) continue;
           sums[i] += isCharge
-            ? (parseFloat(cell.dataset.base) || 0) * hours
+            ? chargeBase(cell) * hours
             : parseFloat(cell.textContent.replace(/[^0-9.-]/g, '')) || 0;
         }}
       }});
 
       const grand = sums.reduce((a, b) => a + b, 0);
-      const fmt   = isCharge
-        ? v => Math.round(v).toLocaleString()
-        : v => v.toFixed(2);
+      const fmt   = isCharge ? fmtVal : v => v.toFixed(2);
 
       for (let i = 0; i < nMonths; i++) totalRow.cells[i + 1].textContent = fmt(sums[i]);
       if (isProjTotal) totalRow.cells[nMonths + 1].textContent = fmt(grand);
@@ -2086,22 +2222,58 @@ HTML = f"""<!doctype html>
     }};
   }})();
 
-  // ─ Charge: live monthly-hours recalculation ────────────────────────────────
+  // ─ Charge: factor toggles + live recalculation ────────────────────────────
   (function () {{
-    const input = document.getElementById('chargeHours');
+    const input   = document.getElementById('chargeHours');
     if (!input) return;
-    function fmt(v) {{ return Math.round(v).toLocaleString(); }}
-    function recalc() {{
-      const h = parseFloat(input.value) || 0;
-      // Update non-excluded data cells directly
+
+    // Factor state
+    const factors = {{ prob: true, rate: true, hours: true }};
+
+    function getBase(el) {{
+      // Pick the pre-aggregated base that matches the active prob/rate toggles
+      const useProp = factors.prob;
+      const useRate = factors.rate;
+      if (useProp && useRate)  return parseFloat(el.dataset.base)      || 0;  // FTE × Prob × Rate
+      if (useProp && !useRate) return parseFloat(el.dataset.baseProb)  || 0;  // FTE × Prob
+      if (!useProp && useRate) return parseFloat(el.dataset.baseRate)  || 0;  // FTE × Rate
+      return parseFloat(el.dataset.baseFte) || 0;                             // FTE only
+    }}
+
+    function fmt(v) {{
+      return factors.rate || factors.prob
+        ? Math.round(v).toLocaleString()
+        : v.toFixed(2);
+    }}
+
+    function recalcCharge() {{
+      const h = factors.hours ? (parseFloat(input.value) || 0) : 1;
       document.querySelectorAll('#sec-charge [data-base]').forEach(el => {{
         if (el.closest('tr')?.classList.contains('row-excluded')) return;
-        el.textContent = fmt((parseFloat(el.dataset.base) || 0) * h);
+        el.textContent = fmt(getBase(el) * h);
       }});
-      // Then let filterable recalc update total/remaining respecting exclusions
       if (window._recalcFilterable) window._recalcFilterable();
     }}
-    input.addEventListener('input', recalc);
+
+    // Wire factor buttons
+    document.querySelectorAll('.charge-factor').forEach(btn => {{
+      btn.addEventListener('click', () => {{
+        const f = btn.dataset.factor;
+        factors[f] = !factors[f];
+        btn.setAttribute('aria-pressed', factors[f] ? 'true' : 'false');
+        // Show/hide hours input based on hours factor
+        if (f === 'hours') {{
+          const ctrl = document.querySelector('.charge-controls');
+          if (ctrl) ctrl.style.opacity = factors.hours ? '1' : '0.35';
+        }}
+        recalcCharge();
+      }});
+    }});
+
+    input.addEventListener('input', recalcCharge);
+
+    // Expose for filterable recalc
+    window._recalcCharge = recalcCharge;
   }})();
 
   // ─ CSV download ──────────────────────────────────────────────────
